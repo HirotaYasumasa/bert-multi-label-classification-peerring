@@ -1,0 +1,25 @@
+[tool.poetry]
+name = "bert-multi-classification-peerring"
+version = "0.1.0"
+description = ""
+authors = ["HirotaYasumasa <mi23a005@oecu.jp>"]
+readme = "README.md"
+packages = [{include = "bert_multi_classification_peerring"}]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+pandas = "^2.0.3"
+classopt = "^0.2.1"
+tqdm = "^4.65.0"
+torch = "1.13.0"
+scikit-learn = "^1.3.0"
+transformers = "^4.30.2"
+seaborn = "^0.12.2"
+matplotlib = "^3.7.2"
+fugashi = "^1.2.1"
+unidic-lite = "^1.0.8"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
