@@ -3,8 +3,6 @@ name = "bert-multi-classification-peerring"
 version = "0.1.0"
 description = ""
 authors = ["HirotaYasumasa <mi23a005@oecu.jp>"]
-readme = "README.md"
-packages = [{include = "bert_multi_classification_peerring"}]
 
 [tool.poetry.dependencies]
 python = "^3.11"
