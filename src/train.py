@@ -3,8 +3,9 @@ from pathlib import Path
 
 import torch
 from classopt import classopt
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_curve, auc, roc_auc_score
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, f1_score, roc_curve, auc, roc_auc_score
 from sklearn.model_selection import KFold
+from scipy.optimize import minimize_scalar
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -29,7 +30,7 @@ class Args:
     dataset_dir: Path = "./datasets/peerring"
 
     batch_size: int = 16
-    epochs: int = 2
+    epochs: int = 5
     lr: float = 2e-5
     num_warmup_epochs: int = 2
     max_seq_len: int = 128
@@ -87,11 +88,11 @@ def main(args: Args):
 
 
     @torch.inference_mode()
-    def evaluate(dataloader: DataLoader) -> dict[str, float]:
+    def evaluate(dataloader: DataLoader, is_val: bool = False, thresholds: list[float] = None) -> dict[str, float]:
         model.eval()
         loss = 0
         total_samples = 0
-        gold_labels, pred_labels = [], []
+        gold_labels, pred_labels, pred_scores = [], [], []
 
         for batch in tqdm(dataloader, total=len(dataloader), dynamic_ncols=True, leave=False):
             batch = {k: v.to(args.device) for k, v in batch.items()}
@@ -100,18 +101,40 @@ def main(args: Args):
             loss += out.loss.item() * batch_size
             total_samples += batch_size
 
-            threshold = 0.5
             gold_labels += batch['labels'].tolist()
-            pred_labels += (torch.sigmoid(out.logits) > threshold).tolist()
-        
+            pred_scores += torch.sigmoid(out.logits).tolist()
+
+        if is_val:
+            thresholds_np = np.arange(0, 1.05, 0.01)
+            best_thresholds = np.zeros(len(args.labels))
+            gold_labels_np = np.array(gold_labels)
+            pred_scores_np = np.array(pred_scores)
+            for i in range(len(args.labels)):
+                best_f1 = 0
+                for threshold in thresholds_np:
+                    temp_pred_labels = (pred_scores_np[:, i] > threshold).astype(int)
+                    f1 = f1_score(gold_labels_np[:, i], temp_pred_labels)
+                    if f1 > best_f1:
+                        best_f1 = f1
+                        best_thresholds[i] = threshold
+
+            pred_labels = (pred_scores_np > best_thresholds).astype(int).tolist()
+
+        else:
+            if thresholds is None:
+                thresholds = [0.5] * len(args.labels)
+                pred_labels = (np.array(pred_scores) > np.array(thresholds)).astype(int).tolist()
+            else:
+                pred_labels = (np.array(pred_scores) > np.array(thresholds)).astype(int).tolist()
+            
         accuracy = accuracy_score(gold_labels, pred_labels)
         accuracies = [accuracy_score(np.array(gold_labels)[:, i], np.array(pred_labels)[:, i]) for i in range(len(args.labels))]
 
         precision_per_labels, recall_per_labels, f1_per_labels, _ = precision_recall_fscore_support(
             gold_labels,
             pred_labels,
-            average= None,
-            zero_division=0
+            average = None,
+            zero_division = 0
         )
 
         precision = np.mean(precision_per_labels)
@@ -125,18 +148,19 @@ def main(args: Args):
                 "precision": precision,
                 "recall": recall,
                 "f1": f1,
+                **({f"label_threshold_{label}": threshold for label, threshold in zip(args.labelnames, best_thresholds)} if is_val else {})
             },
             {
                 "labels_accuracy": accuracies,
                 "labels_precision": precision_per_labels,
                 "labels_recall": recall_per_labels,
                 "labels_f1": f1_per_labels,
+                "labels_thresholds": best_thresholds if is_val else None,
             },
         )
     
-
     @torch.inference_mode()
-    def test_evaluate(dataloader: DataLoader) -> dict[str, float]:
+    def test_evaluate(dataloader: DataLoader, thresholds: list[float]) -> dict[str, float]:
         model.eval()
         total_loss = 0
         total_samples = 0
@@ -149,9 +173,7 @@ def main(args: Args):
             total_loss += out.loss.item() * batch_size
             total_samples += batch_size
 
-            threshold = 0.5
             gold_labels += batch['labels'].tolist()
-            pred_labels += (torch.sigmoid(out.logits) > threshold).tolist()
             pred_scores += torch.sigmoid(out.logits).tolist()
 
         gold_labels_np = np.array(gold_labels)
@@ -159,6 +181,9 @@ def main(args: Args):
 
         roc_auc = roc_auc_score(gold_labels_np, pred_scores_np)
         auc_per_labels = [roc_auc_score(gold_labels_np[:, i], pred_scores_np[:, i]) for i in range(len(args.labels))]
+
+        pred_labels = [(np.array(pred_scores)[:, i] > thresholds[i]).tolist() for i in range(len(thresholds))]
+        pred_labels = list(map(list, zip(*pred_labels)))
 
         accuracy = accuracy_score(gold_labels, pred_labels)
         accuracies = [accuracy_score(np.array(gold_labels)[:, i], np.array(pred_labels)[:, i]) for i in range(len(args.labels))]
@@ -189,6 +214,7 @@ def main(args: Args):
                 "labels_recall": recall_per_labels,
                 "labels_f1": f1_per_labels,
                 "labels_auc": auc_per_labels,
+                "labels_thresholds": thresholds,
             },
             {
                 "gold_labels": gold_labels,
@@ -281,6 +307,8 @@ def main(args: Args):
 
     test_dataloader: DataLoader = create_loader(test_dataset, shuffle=False)
 
+    thresholds_per_fold = []
+    
     for i, (train_idx, val_idx) in enumerate(kf.split(train_val_dataset)):
         train_dataset = [train_val_dataset[i] for i in train_idx]
         val_dataset = [train_val_dataset[i] for i in val_idx]
@@ -335,11 +363,13 @@ def main(args: Args):
                 lr_scheduler.step()
 
             model.eval()
-            macro_metrics, _ = evaluate(val_dataloader)
+            macro_metrics, label_metrics = evaluate(val_dataloader, True)
+            labels_thresholds = label_metrics['labels_thresholds']
+            thresholds_per_fold.append(labels_thresholds)
             val_metrics = {"epoch": f"{epoch + 1}", **macro_metrics}
             val_log(val_metrics, i)
 
-            macro_metrics, _ = evaluate(train_dataloader)
+            macro_metrics, _ = evaluate(train_dataloader, False, labels_thresholds)
             train_metrics = {"epoch": f"{epoch + 1}", **macro_metrics}
             train_log(train_metrics, i)
 
@@ -351,18 +381,21 @@ def main(args: Args):
         model.load_state_dict(best_state_dict)
         model.eval().to(args.device, non_blocking=True)
 
-        val_macro_metrics, _ = evaluate(val_dataloader)
+        average_thresholds = np.mean(thresholds_per_fold, axis=0)
+
+        val_macro_metrics, _ = evaluate(val_dataloader, False, average_thresholds)
         val_metrics = {"best-epoch": best_epoch, **val_macro_metrics}
         utils.save_json(val_metrics, args.output_dir / f"fold{i + 1}" / "val-metrics.json")
 
-        test_macro_metrics, test_labels_metrics, prediction_data = test_evaluate(test_dataloader)
+        test_macro_metrics, test_labels_metrics, prediction_data = test_evaluate(test_dataloader, average_thresholds)
         test_metrics = {**test_macro_metrics}
         expanded_label_metrics = [{ "label": label, 
                             "accuracy": test_labels_metrics['labels_accuracy'][i], 
                             "precision": test_labels_metrics['labels_precision'][i], 
                             "recall": test_labels_metrics['labels_recall'][i], 
                             "f1": test_labels_metrics['labels_f1'][i],
-                            "auc": test_labels_metrics['labels_auc'][i]
+                            "auc": test_labels_metrics['labels_auc'][i],
+                            "threshold": test_labels_metrics['labels_thresholds'][i],
                           } for i, label in enumerate(args.labelnames)]
         combined_metrics = {"test_metrics": test_metrics, "label_metrics": expanded_label_metrics}
         utils.save_json(combined_metrics, args.output_dir / f"fold{i + 1}" / "test-metrics.json")
@@ -376,3 +409,4 @@ def main(args: Args):
 if __name__ == "__main__":
     args = Args.from_args()
     main(args)
+
